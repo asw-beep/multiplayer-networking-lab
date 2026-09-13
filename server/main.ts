@@ -10,10 +10,14 @@
  * scores, the match clock, and the phase. What a client owns: which keys its
  * user is holding, and nothing else whatsoever.
  *
+ * M4 added the two clocks. The world advances in FIXED steps at
+ * SIMULATION_HZ, and snapshots go out separately at SNAPSHOT_HZ. Both are
+ * configurable so the difference can be felt rather than argued about:
+ *
+ *   SIM_HZ=5 npm run game        the world updates in visible lurches
+ *   SNAPSHOT_HZ=2 npm run game   the world is smooth; nobody is told in time
+ *
  * Deliberately NOT here yet:
- *  - a fixed timestep (M4) - this loop uses a measured delta, which is honest
- *    but not reproducible, and M4 explains why that matters;
- *  - tick numbers on snapshots (M4);
  *  - anything resembling prediction (M6). The lag you feel playing this is the
  *    entire motivation for M5-M7 and must not be papered over now.
  *
@@ -45,15 +49,44 @@ import {
   type ServerMessage,
 } from '../shared/protocol.js';
 
+function rateFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0 || value > 240) {
+    console.warn(`[warn]  ignoring ${name}=${raw}; using ${fallback} Hz`);
+    return fallback;
+  }
+  return value;
+}
+
 /**
- * How often the server advances the world and describes it.
- *
- * In M4 these become two separate numbers - a simulation that ticks at one
- * rate and snapshots that go out at another - because they answer different
- * questions. For now one interval does both, which is the simplest thing that
- * can possibly work and therefore the right thing to start from.
+ * How often the world advances. Every step is exactly 1/SIMULATION_HZ seconds
+ * of simulated time, regardless of how late the timer actually fired.
  */
-const TICK_INTERVAL_MS = 50; // 20 Hz
+const SIMULATION_HZ = rateFromEnv('SIM_HZ', 30);
+
+/**
+ * How often clients are told about it. Lower than the simulation rate on
+ * purpose: describing the world is the expensive part - it costs a full
+ * serialised copy per client per snapshot - while advancing it is cheap.
+ */
+const SNAPSHOT_HZ = rateFromEnv('SNAPSHOT_HZ', 10);
+
+/** Seconds of simulated time per step. The only delta `update()` ever sees. */
+const FIXED_DELTA_SECONDS = 1 / SIMULATION_HZ;
+
+/**
+ * The spiral-of-death guard.
+ *
+ * If the process stalls - GC, a laptop lid, a debugger - the accumulator would
+ * hold seconds of unsimulated time and the catch-up loop would try to run
+ * hundreds of steps at once. That takes longer than real time, so the next
+ * frame is even further behind, and the server never recovers. Discarding the
+ * excess makes the world briefly run slow, which is survivable; the spiral is
+ * not.
+ */
+const MAX_ACCUMULATED_SECONDS = 0.25;
 
 // ---------------------------------------------------------------------------
 // Room
@@ -114,11 +147,14 @@ function broadcast(message: ServerMessage): void {
 function broadcastSnapshot(): void {
   broadcast({
     type: 'snapshot',
+    tick: state.tick,
     phase: state.phase,
     players: state.players,
     coins: state.coins,
     timeRemaining: state.timeRemaining,
     playersPerRoom: PLAYERS_PER_ROOM,
+    simulationHz: SIMULATION_HZ,
+    snapshotHz: SNAPSHOT_HZ,
   });
 }
 
@@ -149,7 +185,10 @@ function startMatchIfEveryoneIsReady(): void {
  * is a LAN-visible server with no authentication, which is fine for a trusted
  * home network and would not be fine anywhere else.
  */
-const server = new WebSocketServer({ port: GAME_PORT, host: '0.0.0.0' });
+/** Overridable so a second server can be run alongside the normal one. */
+const PORT = Number(process.env['GAME_PORT'] ?? GAME_PORT);
+
+const server = new WebSocketServer({ port: PORT, host: '0.0.0.0' });
 
 server.on('connection', (socket) => {
   if (connections.size >= PLAYERS_PER_ROOM) {
@@ -252,11 +291,36 @@ function localAddresses(): string[] {
 }
 
 server.on('listening', () => {
-  console.log(`Game server listening on ws://0.0.0.0:${GAME_PORT}`);
-  console.log(`Simulating at ${Math.round(1000 / TICK_INTERVAL_MS)} Hz`);
+  console.log(`Game server listening on ws://0.0.0.0:${PORT}`);
+  console.log(
+    `Simulation ${SIMULATION_HZ} Hz (${(FIXED_DELTA_SECONDS * 1000).toFixed(1)}ms/step)` +
+      `  |  snapshots ${SNAPSHOT_HZ} Hz`,
+  );
+  console.log('  override with SIM_HZ / SNAPSHOT_HZ');
   for (const address of localAddresses()) {
-    console.log(`  reachable on this network at ws://${address}:${GAME_PORT}`);
+    console.log(`  reachable on this network at ws://${address}:${PORT}`);
   }
+});
+
+/**
+ * Server-level failures, as opposed to one connection's failures.
+ *
+ * Without this handler an 'error' here is unhandled and Node exits with a
+ * stack trace, which tells a reader nothing about what to do. The common case
+ * by far is a stale server still holding the port after a restart, so say so.
+ */
+server.on('error', (error: NodeJS.ErrnoException) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`
+Port ${PORT} is already in use.`);
+    console.error('Another game server is probably still running. Either stop it,');
+    console.error(`or start this one elsewhere:  GAME_PORT=8082 npm run game
+`);
+    process.exit(1);
+  }
+
+  console.error('[server error]', error.message);
+  process.exit(1);
 });
 
 // ---------------------------------------------------------------------------
@@ -264,22 +328,61 @@ server.on('listening', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * `setInterval` does not promise to fire on time - it promises not to fire
- * early. Under load the gap between ticks stretches, so the delta is MEASURED
- * rather than assumed to be TICK_INTERVAL_MS.
+ * The fixed-timestep loop.
  *
- * This is still a variable timestep, and therefore still not reproducible:
- * replaying the same inputs will not reproduce the same positions, because the
- * deltas will differ. Nothing in M3 needs reproducibility. Prediction does,
- * which is why M4 replaces this with a fixed timestep before M6 arrives.
+ * The problem with M3's loop was not that it was inaccurate - it measured the
+ * real delta honestly. The problem is that it was not REPRODUCIBLE. Feed the
+ * same inputs in twice and you get different positions, because the deltas
+ * differ by a millisecond here and there. That is fine when one machine owns
+ * the answer and nobody checks its work.
+ *
+ * It stops being fine in M6/M7, where the client runs this same simulation to
+ * predict its own movement and then replays inputs to reconcile. Prediction is
+ * only useful if the client can arrive at the SAME number the server will.
+ * Identical inputs plus identical timesteps give identical results; identical
+ * inputs plus whatever-the-timer-did do not.
+ *
+ * So: real elapsed time goes into an accumulator, and the world is advanced in
+ * whole steps of exactly FIXED_DELTA_SECONDS until less than one step remains.
+ * The timer being late no longer changes the physics - it only changes how
+ * many steps run in one pass.
+ *
+ *   accumulator += elapsed
+ *   while (accumulator >= dt) { update(dt); accumulator -= dt }
+ *
+ * This is Gaffer On Games' "Fix Your Timestep", minus the interpolation of the
+ * leftover remainder - that belongs on the client, in M8.
  */
 let previousTickAt = process.hrtime.bigint();
+let accumulator = 0;
 
-setInterval(() => {
-  const now = process.hrtime.bigint();
-  const deltaSeconds = Number(now - previousTickAt) / 1_000_000_000;
-  previousTickAt = now;
+setInterval(
+  () => {
+    const now = process.hrtime.bigint();
+    const elapsedSeconds = Number(now - previousTickAt) / 1_000_000_000;
+    previousTickAt = now;
 
-  update(state, latestInputs, Math.min(deltaSeconds, 0.1));
-  broadcastSnapshot();
-}, TICK_INTERVAL_MS);
+    accumulator += Math.min(elapsedSeconds, MAX_ACCUMULATED_SECONDS);
+
+    while (accumulator >= FIXED_DELTA_SECONDS) {
+      update(state, latestInputs, FIXED_DELTA_SECONDS);
+      accumulator -= FIXED_DELTA_SECONDS;
+    }
+  },
+  Math.max(1, Math.round(1000 / SIMULATION_HZ)),
+);
+
+/**
+ * Snapshots, on their own clock.
+ *
+ * This is the separation M4 exists to demonstrate. The world can advance 30
+ * times a second while clients hear about it 10 times a second - and the
+ * client's screen refreshes 60 times a second on top of that. Three rates,
+ * three different reasons, and no reason for any of them to match.
+ *
+ * Lower the snapshot rate and the simulation stays perfectly correct; it is
+ * the clients' picture of it that gets coarse. That is the whole argument for
+ * interpolation in M8: the missing information is not missing from the world,
+ * only from the description of it.
+ */
+setInterval(broadcastSnapshot, Math.max(1, Math.round(1000 / SNAPSHOT_HZ)));

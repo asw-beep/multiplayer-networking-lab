@@ -68,24 +68,37 @@ export interface RoomFullMessage {
 }
 
 /**
- * The server's description of the world.
+ * The server's description of the world, as of a particular simulation step.
  *
  * This is a *full* snapshot: every player, every coin, every time. It is
  * wasteful and it is the right starting point — delta compression (M12.4) is
  * only worth doing once there is a measured bandwidth problem to point at.
  *
- * No tick number yet. That arrives in M4 along with the fixed timestep, and it
- * is what later lets the client say "this snapshot is older than the one I
- * already drew" and ignore it.
+ * The `tick` is what M4 adds, and it changes what a snapshot *is*. Without it
+ * a snapshot is "the world"; with it, a snapshot is "the world at a known
+ * moment" — something that can be placed on a timeline, compared with another,
+ * and interpolated between. M7 and M8 are both impossible without it.
  */
 export interface SnapshotMessage {
   type: 'snapshot';
+  /** The simulation step this snapshot describes. */
+  tick: number;
   phase: MatchPhase;
   players: Player[];
   coins: Coin[];
   timeRemaining: number;
   /** How many players the room needs before a match can start. */
   playersPerRoom: number;
+  /**
+   * The two rates, reported so the client can display them.
+   *
+   * They are deliberately separate numbers. The simulation rate is how often
+   * the world advances; the snapshot rate is how often anyone is told about
+   * it. Conflating them - as M3 did - hides the fact that they answer
+   * different questions and have different costs.
+   */
+  simulationHz: number;
+  snapshotHz: number;
 }
 
 export type ServerMessage = WelcomeMessage | RoomFullMessage | SnapshotMessage;

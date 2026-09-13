@@ -13,6 +13,11 @@
  * The client never calls `update()` in M3. It gets the right to run this code
  * again in M6 — but only to *predict*, and only on the understanding that the
  * server's answer always wins.
+ *
+ * M4 note: `update()` is now always called with the SAME `deltaSeconds` - one
+ * fixed timestep. It still takes delta as a parameter rather than hard-coding
+ * it, because M7's reconciliation replays inputs through this same function
+ * and must be able to reproduce the server's arithmetic exactly.
  */
 
 // ---------------------------------------------------------------------------
@@ -88,6 +93,18 @@ export interface GameState {
   coins: Coin[];
   timeRemaining: number;
   nextCoinId: number;
+  /**
+   * How many fixed simulation steps have been run since the server started.
+   *
+   * This is the server's own clock, and it is the thing that makes a snapshot
+   * mean something: "here is the world" is not useful, "here is the world as
+   * of step 1042" can be placed on a timeline. M7 reconciles against it and M8
+   * interpolates between two of them.
+   *
+   * It counts steps, not seconds, and it advances even in the lobby - the
+   * server is ticking whether or not anyone is playing.
+   */
+  tick: number;
 }
 
 /**
@@ -154,6 +171,7 @@ export function createInitialState(): GameState {
     coins: [],
     timeRemaining: MATCH_DURATION_SECONDS,
     nextCoinId: 1,
+    tick: 0,
   };
 }
 
@@ -317,6 +335,11 @@ export function update(
   inputs: ReadonlyMap<PlayerId, InputState>,
   deltaSeconds: number,
 ): void {
+  // The tick advances first and unconditionally. It is a count of simulation
+  // steps taken, not of steps that happened to do something, so a snapshot
+  // from the lobby still carries a meaningful "when".
+  state.tick += 1;
+
   if (state.phase !== 'playing') return;
 
   for (const player of state.players) {

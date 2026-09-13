@@ -42,10 +42,35 @@ const view: ViewState = {
   players: [],
   coins: [],
   timeRemaining: MATCH_DURATION_SECONDS,
+  tick: 0,
+  simulationHz: 0,
+  snapshotHz: 0,
+  measuredSnapshotHz: 0,
+  measuredRenderHz: 0,
   localPlayerId: null,
   playersPerRoom: 2,
   connection: 'connecting',
 };
+
+/**
+ * Counters for the measured rates. The server REPORTS what it intends to do;
+ * these count what actually arrived and what was actually drawn, which is not
+ * automatically the same thing - and under M5's artificial packet loss it will
+ * very deliberately not be.
+ *
+ * They are measured on two DIFFERENT clocks, which is the M4 lesson applied to
+ * the instrumentation itself:
+ *
+ *   snapshots arrive on the network's clock  -> counted against setInterval
+ *   frames are drawn on the display's clock  -> counted inside rAF
+ *
+ * Using rAF for both would have been wrong, and visibly so: a backgrounded tab
+ * stops getting frames while snapshots keep arriving, and the readout would
+ * have claimed zero snapshots when the socket was still busy.
+ */
+let snapshotsSinceLastCount = 0;
+let framesSinceLastCount = 0;
+let frameWindowStartedAt = 0;
 
 /** Updated by `main()` once the lobby DOM is wired up. */
 let updateLobby: (view: ViewState) => void = () => {};
@@ -169,8 +194,27 @@ function connect(): void {
         break;
 
       case 'snapshot':
+        /**
+         * Reject anything not newer than what we already have.
+         *
+         * Over a WebSocket this can never fire: TCP delivers in order, so a
+         * snapshot cannot overtake an older one. It is here because the guard
+         * has to exist before the thing it guards against does - M5 adds a
+         * network simulator that reorders and drops deliberately, and M12
+         * looks at UDP, where out-of-order delivery is normal rather than
+         * impossible.
+         *
+         * Drawing a stale snapshot would make players visibly jump backwards.
+         */
+        if (message.tick <= view.tick && view.tick !== 0) return;
+
+        snapshotsSinceLastCount += 1;
+
         // Wholesale replacement. There is no merging, no reconciling, no
         // arguing with the server - in M3 the snapshot simply IS the world.
+        view.tick = message.tick;
+        view.simulationHz = message.simulationHz;
+        view.snapshotHz = message.snapshotHz;
         view.phase = message.phase;
         view.players = message.players;
         view.coins = message.coins;
@@ -229,7 +273,29 @@ function main(): void {
    * second being drawn 60 times a second means each position is drawn three
    * times before it changes. M8's interpolation is the answer.
    */
-  const frame = (): void => {
+  // Snapshot arrival, counted on a timer that keeps running when the tab is
+  // hidden - because the socket does too.
+  let lastSnapshotCountAt = performance.now();
+  setInterval(() => {
+    const now = performance.now();
+    const seconds = (now - lastSnapshotCountAt) / 1000;
+    lastSnapshotCountAt = now;
+    if (seconds > 0) view.measuredSnapshotHz = snapshotsSinceLastCount / seconds;
+    snapshotsSinceLastCount = 0;
+  }, 1000);
+
+  const frame = (timestamp: number): void => {
+    framesSinceLastCount += 1;
+
+    // Frames, counted where frames actually happen.
+    if (frameWindowStartedAt === 0) frameWindowStartedAt = timestamp;
+    const windowSeconds = (timestamp - frameWindowStartedAt) / 1000;
+    if (windowSeconds >= 1) {
+      view.measuredRenderHz = framesSinceLastCount / windowSeconds;
+      framesSinceLastCount = 0;
+      frameWindowStartedAt = timestamp;
+    }
+
     render(context, view);
     requestAnimationFrame(frame);
   };

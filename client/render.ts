@@ -22,6 +22,15 @@ export interface ViewState {
   players: Player[];
   coins: Coin[];
   timeRemaining: number;
+  /** The simulation step the last accepted snapshot described. */
+  tick: number;
+  /** Server rates, reported in each snapshot so the client can display them. */
+  simulationHz: number;
+  snapshotHz: number;
+  /** Snapshots actually accepted in the last second, measured by the client. */
+  measuredSnapshotHz: number;
+  /** Frames drawn in the last second. */
+  measuredRenderHz: number;
   /** Which player the local browser is controlling, once the server has said. */
   localPlayerId: PlayerId | null;
   /** How many seats the room has, as reported by the server. */
@@ -122,6 +131,33 @@ function drawHud(context: CanvasRenderingContext2D, view: ViewState): void {
 }
 
 /**
+ * The three clocks, side by side.
+ *
+ * This readout is the entire point of M4 made visible: the world advances at
+ * one rate, the client is told at a second rate, and the screen redraws at a
+ * third. Seeing 30 / 10 / 60 in the corner makes "these are different clocks"
+ * a fact you can watch rather than a claim.
+ *
+ * `tick` is the server's step counter, not a time. It climbs whether or not a
+ * match is running.
+ */
+function drawClocks(context: CanvasRenderingContext2D, view: ViewState): void {
+  context.font = '500 11px ui-monospace, "Cascadia Mono", Consolas, monospace';
+  context.textAlign = 'left';
+  context.textBaseline = 'bottom';
+  context.fillStyle = '#4a5266';
+
+  const parts = [
+    `sim ${view.simulationHz}Hz`,
+    `snap ${view.snapshotHz}Hz (${view.measuredSnapshotHz.toFixed(0)} recv)`,
+    `render ${view.measuredRenderHz.toFixed(0)}Hz`,
+    `tick ${view.tick}`,
+  ];
+
+  context.fillText(parts.join('   ·   '), 18, ARENA_HEIGHT - 14);
+}
+
+/**
  * Draw the arena. Nothing else — every "the match is not running" screen is
  * the lobby's job now, which keeps this function to one responsibility and
  * makes the not-playing states focusable and clickable on a phone.
@@ -130,5 +166,8 @@ export function render(context: CanvasRenderingContext2D, view: ViewState): void
   drawArena(context);
   drawCoins(context, view.coins);
   drawPlayers(context, view);
-  if (view.phase === 'playing') drawHud(context, view);
+  if (view.phase === 'playing') {
+    drawHud(context, view);
+    drawClocks(context, view);
+  }
 }
