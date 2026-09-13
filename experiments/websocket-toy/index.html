@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>M2 — WebSocket toy</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #12141a;
+        --panel: #1b1e27;
+        --panel-2: #171a22;
+        --line: #2c3244;
+        --ink: #e6e8ee;
+        --muted: #8b93a7;
+        --accent: #4f8cff;
+        --green: #5bd6a0;
+        --gold: #f2c14e;
+        --red: #ff6b6b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: 28px 16px 48px;
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.6 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+      }
+
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+      }
+
+      h1 {
+        margin: 0 0 4px;
+        font-size: 17px;
+        letter-spacing: -0.01em;
+      }
+
+      h1 span {
+        color: var(--muted);
+        font-weight: 400;
+      }
+
+      .hint {
+        margin: 0 0 20px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      /* --- status bar --- */
+
+      .bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 12px;
+        padding: 10px 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+
+      #status {
+        padding: 2px 10px;
+        border-radius: 20px;
+        font: 600 11px ui-monospace, Consolas, monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        background: rgba(139, 147, 167, 0.16);
+        color: var(--muted);
+      }
+
+      #status[data-state="open"] {
+        background: rgba(91, 214, 160, 0.16);
+        color: var(--green);
+      }
+
+      #status[data-state="connecting"] {
+        background: rgba(242, 193, 78, 0.16);
+        color: var(--gold);
+      }
+
+      #status[data-state="closed"] {
+        background: rgba(255, 107, 107, 0.16);
+        color: var(--red);
+      }
+
+      #online {
+        flex: 1;
+        min-width: 160px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      button {
+        padding: 6px 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--panel-2);
+        color: var(--ink);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      button:hover:not(:disabled) {
+        border-color: var(--accent);
+      }
+
+      button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+
+      /* --- log --- */
+
+      #log {
+        height: 340px;
+        overflow-y: auto;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-2);
+        font: 13px/1.7 ui-monospace, "Cascadia Mono", Consolas, monospace;
+      }
+
+      .line {
+        display: flex;
+        gap: 10px;
+      }
+
+      .stamp {
+        flex: none;
+        color: #4a5266;
+      }
+
+      .line.sys {
+        color: var(--muted);
+      }
+
+      .line.err {
+        color: var(--red);
+      }
+
+      .line.mine {
+        color: var(--accent);
+      }
+
+      .line.them {
+        color: var(--green);
+      }
+
+      /* --- composer --- */
+
+      #composer {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      #message {
+        flex: 1;
+        padding: 9px 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--panel-2);
+        color: var(--ink);
+        font: inherit;
+      }
+
+      #message:focus {
+        outline: none;
+        border-color: var(--accent);
+      }
+
+      #send {
+        border-color: var(--accent);
+        background: rgba(79, 140, 255, 0.14);
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      footer {
+        margin-top: 22px;
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+
+      code {
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: #232839;
+        font-family: ui-monospace, Consolas, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>WebSocket toy <span>— M2: two tabs, one server</span></h1>
+      <p class="hint">
+        Deliberately not the game. Open this page in two tabs and watch a message from one reach the
+        other without anyone asking for it.
+      </p>
+
+      <div class="bar">
+        <span id="status">closed</span>
+        <span id="online">online: nobody</span>
+        <button id="disconnect" type="button">Disconnect</button>
+        <button id="reconnect" type="button">Reconnect</button>
+      </div>
+
+      <div id="log"></div>
+
+      <form id="composer" autocomplete="off">
+        <input id="message" type="text" placeholder="Type a message and press Enter" />
+        <button id="send" type="submit">Send</button>
+      </form>
+
+      <footer>
+        Server: <code>npm run chat</code> → <code>ws://localhost:8080</code>. Try disconnecting one tab
+        and watching the other be told about it.
+      </footer>
+    </main>
+
+    <script type="module" src="./chat.js"></script>
+  </body>
+</html>

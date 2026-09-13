@@ -1,0 +1,26 @@
+{
+  "name": "multiplayer-networking-lab",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A learning-first multiplayer networking laboratory built around a small 2-player game",
+  "author": "asw-beep",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "tsc -p tsconfig.json",
+    "build:server": "tsc -p tsconfig.server.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "serve": "node tools/dev-server.mjs",
+    "game": "node dist-server/server/main.js",
+    "chat": "node experiments/websocket-toy/server.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
