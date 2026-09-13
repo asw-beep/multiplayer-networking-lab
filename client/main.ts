@@ -47,6 +47,7 @@ const view: ViewState = {
   snapshotHz: 0,
   measuredSnapshotHz: 0,
   measuredRenderHz: 0,
+  network: { latencyMs: 0, jitterMs: 0, lossRate: 0 },
   localPlayerId: null,
   playersPerRoom: 2,
   connection: 'connecting',
@@ -215,6 +216,7 @@ function connect(): void {
         view.tick = message.tick;
         view.simulationHz = message.simulationHz;
         view.snapshotHz = message.snapshotHz;
+        view.network = message.network;
         view.phase = message.phase;
         view.players = message.players;
         view.coins = message.coins;

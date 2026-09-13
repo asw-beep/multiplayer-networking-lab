@@ -46,18 +46,55 @@ import {
 import {
   GAME_PORT,
   parseClientMessage,
+  type ClientMessage,
   type ServerMessage,
 } from '../shared/protocol.js';
+import {
+  createLink,
+  describeConditions,
+  isDegraded,
+  PERFECT_NETWORK,
+  type NetworkConditions,
+} from './network-simulator.js';
 
-function rateFromEnv(name: string, fallback: number): number {
-  const raw = process.env[name];
+/**
+ * Settings come from a CLI flag or an environment variable, flag winning.
+ *
+ * Both, because neither works everywhere: `SIM_HZ=60 npm run game` is natural
+ * in bash and simply not valid syntax in PowerShell, while
+ * `npm run game -- --sim-hz 60` works in both. Someone following this project
+ * on Windows should not have to discover that on their own.
+ */
+function setting(flag: string, envName: string): string | undefined {
+  const index = process.argv.indexOf(`--${flag}`);
+  if (index !== -1 && index + 1 < process.argv.length) {
+    return process.argv[index + 1];
+  }
+  return process.env[envName];
+}
+
+function numberSetting(
+  flag: string,
+  envName: string,
+  fallback: number,
+  { min, max }: { min: number; max: number },
+): number {
+  const raw = setting(flag, envName);
   if (raw === undefined) return fallback;
+
   const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0 || value > 240) {
-    console.warn(`[warn]  ignoring ${name}=${raw}; using ${fallback} Hz`);
+  if (!Number.isFinite(value) || value < min || value > max) {
+    console.warn(
+      `[warn]  ignoring --${flag}=${raw} (expected ${min}..${max}); using ${fallback}`,
+    );
     return fallback;
   }
   return value;
+}
+
+function rateFromEnv(name: string, fallback: number): number {
+  const flag = name === 'SIM_HZ' ? 'sim-hz' : 'snapshot-hz';
+  return numberSetting(flag, name, fallback, { min: 1, max: 240 });
 }
 
 /**
@@ -72,6 +109,27 @@ const SIMULATION_HZ = rateFromEnv('SIM_HZ', 30);
  * serialised copy per client per snapshot - while advancing it is cheap.
  */
 const SNAPSHOT_HZ = rateFromEnv('SNAPSHOT_HZ', 10);
+
+/**
+ * The artificial network. Perfect unless asked otherwise.
+ *
+ *   npm run game -- --latency 100 --jitter 20 --loss 0.05
+ *
+ * Applied to every connection, in both directions. This exists to make the
+ * lag that has always been there VISIBLE - nothing here fixes anything, and
+ * nothing should until M6.
+ */
+const NETWORK: NetworkConditions = {
+  latencyMs: numberSetting('latency', 'LATENCY_MS', PERFECT_NETWORK.latencyMs, {
+    min: 0,
+    max: 2000,
+  }),
+  jitterMs: numberSetting('jitter', 'JITTER_MS', PERFECT_NETWORK.jitterMs, {
+    min: 0,
+    max: 1000,
+  }),
+  lossRate: numberSetting('loss', 'LOSS', PERFECT_NETWORK.lossRate, { min: 0, max: 1 }),
+};
 
 /** Seconds of simulated time per step. The only delta `update()` ever sees. */
 const FIXED_DELTA_SECONDS = 1 / SIMULATION_HZ;
@@ -95,6 +153,10 @@ const MAX_ACCUMULATED_SECONDS = 0.25;
 interface Connection {
   socket: WebSocket;
   playerId: PlayerId;
+  /** Server -> this client, through the artificial network. Carries bytes. */
+  outbound: ReturnType<typeof createLink<string>>;
+  /** This client -> server, through the artificial network. Carries parsed messages. */
+  inbound: ReturnType<typeof createLink<ClientMessage>>;
 }
 
 /**
@@ -128,9 +190,48 @@ let nextPlayerId: PlayerId = 1;
 // Sending
 // ---------------------------------------------------------------------------
 
-function send(socket: WebSocket, message: ServerMessage): void {
+/**
+ * Put bytes on the wire immediately. Only the network simulator calls this.
+ */
+function deliverNow(socket: WebSocket, payload: string): void {
+  // The socket may have closed while this message was in flight.
   if (socket.readyState !== socket.OPEN) return;
-  socket.send(JSON.stringify(message));
+  socket.send(payload);
+}
+
+/**
+ * Send to one client, through the artificial network.
+ *
+ * The message is serialised HERE, before it enters the link - not on delivery.
+ * That distinction is the whole difference between a delayed message and a
+ * delayed reference.
+ *
+ * The first version of this passed the message object to the link and let the
+ * delivery callback stringify it 200ms later. But a snapshot holds
+ * `state.players`, which is the server's live array - so by the time it was
+ * serialised the positions had moved on, and every "delayed" snapshot arrived
+ * carrying fresh data. Latency delayed WHEN the client heard, but not WHAT it
+ * heard, and a measured round trip came out at half its real cost.
+ *
+ * Once bytes are on a real wire they are frozen. Serialising at send time is
+ * what makes this simulator honest.
+ *
+ * Snapshots are droppable; the handshake is not. A lost snapshot is superseded
+ * by the next one a tenth of a second later, which is exactly the bet real
+ * games make when they send state unreliably. A lost `welcome` would leave a
+ * client that never learns its own id.
+ */
+function send(socket: WebSocket, message: ServerMessage): void {
+  const payload = JSON.stringify(message);
+  const connection = connections.get(socket);
+
+  if (connection === undefined) {
+    // No connection record yet - a refusal sent before the player was seated.
+    deliverNow(socket, payload);
+    return;
+  }
+
+  connection.outbound.carry(payload, message.type === 'snapshot' ? 'droppable' : 'reliable');
 }
 
 function broadcast(message: ServerMessage): void {
@@ -155,6 +256,11 @@ function broadcastSnapshot(): void {
     playersPerRoom: PLAYERS_PER_ROOM,
     simulationHz: SIMULATION_HZ,
     snapshotHz: SNAPSHOT_HZ,
+    network: {
+      latencyMs: NETWORK.latencyMs,
+      jitterMs: NETWORK.jitterMs,
+      lossRate: NETWORK.lossRate,
+    },
   });
 }
 
@@ -172,6 +278,46 @@ function startMatchIfEveryoneIsReady(): void {
 
   startMatch(state);
   console.log('[match] both players ready - started');
+}
+
+/**
+ * Act on one message from one client.
+ *
+ * Called by the inbound link, which means it may run long after the frame
+ * actually arrived - or never, if the simulator dropped it. Parsing happens
+ * before the link, so malformed frames are rejected at arrival rather than
+ * being carefully delayed and then thrown away.
+ */
+function handleClientMessage(socket: WebSocket, message: ClientMessage): void {
+  const connection = connections.get(socket);
+  if (connection === undefined) return;
+
+  if (message.type === 'ready') {
+    setReady(state, connection.playerId, message.ready);
+    console.log(
+      `[lobby] player ${connection.playerId} is ${message.ready ? 'ready' : 'not ready'}`,
+    );
+    startMatchIfEveryoneIsReady();
+    broadcastSnapshot();
+    return;
+  }
+
+  /**
+   * The input is recorded, not acted upon. It will be applied by the next
+   * tick, along with everyone else's, so no player gains an advantage by
+   * sending more messages per second than anyone else.
+   *
+   * M5 note: this map is the planted bug. The server keeps the last input it
+   * heard and reapplies it every tick until told otherwise - so if the message
+   * saying "I released D" is the one the simulator drops, this player keeps
+   * running right until their next keypress.
+   */
+  latestInputs.set(connection.playerId, {
+    up: message.up,
+    down: message.down,
+    left: message.left,
+    right: message.right,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +347,19 @@ server.on('connection', (socket) => {
   }
 
   const playerId = nextPlayerId++;
-  connections.set(socket, { socket, playerId });
+
+  // Two one-way links: what we send them, and what they send us. Real latency
+  // is paid in both directions, which is why a round trip costs twice it.
+  const outbound = createLink<string>(
+    () => NETWORK,
+    (payload) => deliverNow(socket, payload),
+  );
+  const inbound = createLink<ClientMessage>(
+    () => NETWORK,
+    (message) => handleClientMessage(socket, message),
+  );
+
+  connections.set(socket, { socket, playerId, outbound, inbound });
   addPlayer(state, playerId);
   latestInputs.set(playerId, { up: false, down: false, left: false, right: false });
 
@@ -221,37 +379,31 @@ server.on('connection', (socket) => {
 
     const message = parseClientMessage(data.toString());
     if (message === null) {
-      // Ignore, do not disconnect. Garbage from one client is not the other
-      // player's problem, and a parser that throws here would end the match.
       console.warn(`[warn]  player ${connection.playerId} sent an unusable message`);
       return;
     }
 
-    if (message.type === 'ready') {
-      setReady(state, connection.playerId, message.ready);
-      console.log(
-        `[lobby] player ${connection.playerId} is ` +
-          `${message.ready ? 'ready' : 'not ready'}`,
-      );
-      startMatchIfEveryoneIsReady();
-      broadcastSnapshot();
-      return;
-    }
-
-    // The input is recorded, not acted upon. It will be applied by the next
-    // tick, along with everyone else's, so no player gains an advantage by
-    // sending more messages per second than anyone else.
-    latestInputs.set(connection.playerId, {
-      up: message.up,
-      down: message.down,
-      left: message.left,
-      right: message.right,
-    });
+    /**
+     * Only `input` is droppable, matching the outbound rule where only
+     * snapshots are.
+     *
+     * The first version dropped everything a client sent, which meant a lost
+     * `ready` press left the lobby waiting forever with no way to retry
+     * short of clicking again - and at 40% loss, a test hung outright. Real
+     * games run lobby and control traffic on a reliable channel precisely
+     * because there is no next message along to supersede a lost one.
+     */
+    connection.inbound.carry(message, message.type === 'input' ? 'droppable' : 'reliable');
   });
 
   socket.on('close', (code) => {
     const connection = connections.get(socket);
     if (connection === undefined) return;
+
+    // Anything still in flight is now undeliverable; cancel the timers rather
+    // than let them fire against a dead socket and hold the process open.
+    connection.outbound.cancelAll();
+    connection.inbound.cancelAll();
 
     connections.delete(socket);
     removePlayer(state, connection.playerId);
@@ -296,7 +448,13 @@ server.on('listening', () => {
     `Simulation ${SIMULATION_HZ} Hz (${(FIXED_DELTA_SECONDS * 1000).toFixed(1)}ms/step)` +
       `  |  snapshots ${SNAPSHOT_HZ} Hz`,
   );
-  console.log('  override with SIM_HZ / SNAPSHOT_HZ');
+  console.log(`Network:    ${describeConditions(NETWORK)}`);
+  if (!isDegraded(NETWORK)) {
+    console.log('');
+    console.log('  Loopback is not a network. To feel what M6-M8 are for:');
+    console.log('    npm run game -- --latency 100');
+    console.log('    npm run game -- --latency 150 --jitter 30 --loss 0.05');
+  }
   for (const address of localAddresses()) {
     console.log(`  reachable on this network at ws://${address}:${PORT}`);
   }

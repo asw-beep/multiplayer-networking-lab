@@ -31,6 +31,8 @@ export interface ViewState {
   measuredSnapshotHz: number;
   /** Frames drawn in the last second. */
   measuredRenderHz: number;
+  /** Artificial network conditions the server reports it is applying. */
+  network: { latencyMs: number; jitterMs: number; lossRate: number };
   /** Which player the local browser is controlling, once the server has said. */
   localPlayerId: PlayerId | null;
   /** How many seats the room has, as reported by the server. */
@@ -155,6 +157,19 @@ function drawClocks(context: CanvasRenderingContext2D, view: ViewState): void {
   ];
 
   context.fillText(parts.join('   ·   '), 18, ARENA_HEIGHT - 14);
+
+  // The simulated network, called out separately and in a warning colour,
+  // because a laggy build is easy to mistake for a broken one.
+  const { latencyMs, jitterMs, lossRate } = view.network;
+  if (latencyMs > 0 || jitterMs > 0 || lossRate > 0) {
+    context.fillStyle = COLOURS.timeLow;
+    context.textAlign = 'right';
+    const net =
+      `SIMULATED NET  ${latencyMs}ms` +
+      (jitterMs > 0 ? ` ±${jitterMs}ms` : '') +
+      (lossRate > 0 ? `  ${(lossRate * 100).toFixed(1)}% loss` : '');
+    context.fillText(net, ARENA_WIDTH - 18, ARENA_HEIGHT - 14);
+  }
 }
 
 /**

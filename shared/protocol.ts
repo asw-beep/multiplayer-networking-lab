@@ -99,6 +99,16 @@ export interface SnapshotMessage {
    */
   simulationHz: number;
   snapshotHz: number;
+  /**
+   * The artificial network conditions in force, so the client can display
+   * them. Development tooling, reported rather than negotiated - the client
+   * has no say in this and cannot switch it off.
+   */
+  network: {
+    latencyMs: number;
+    jitterMs: number;
+    lossRate: number;
+  };
 }
 
 export type ServerMessage = WelcomeMessage | RoomFullMessage | SnapshotMessage;
