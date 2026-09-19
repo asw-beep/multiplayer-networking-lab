@@ -15,6 +15,7 @@ import {
   type MatchPhase,
   type Player,
   type PlayerId,
+  type Vector2,
 } from '../shared/game.js';
 
 export interface ViewState {
@@ -35,6 +36,20 @@ export interface ViewState {
   network: { latencyMs: number; jitterMs: number; lossRate: number };
   /** Which player the local browser is controlling, once the server has said. */
   localPlayerId: PlayerId | null;
+  /**
+   * Where the client BELIEVES its own square is, having applied its own
+   * inputs without waiting for permission. Null outside a running match, when
+   * there is nothing to predict and the server's word is simply followed.
+   *
+   * This is the only number on the client that is not a copy of something the
+   * server said. It is a guess, and M6 draws it next to the truth rather than
+   * instead of it.
+   */
+  predicted: Vector2 | null;
+  /** Inputs sent but not yet acknowledged - the depth of the pending buffer. */
+  pendingInputCount: number;
+  /** The last input sequence number the server says it has simulated for us. */
+  lastAckedInput: number;
   /** How many seats the room has, as reported by the server. */
   playersPerRoom: number;
   /** Connection status, owned by the client rather than the snapshot. */
@@ -52,6 +67,8 @@ const COLOURS = {
   textMuted: '#8b93a7',
   overlay: 'rgba(18, 20, 26, 0.84)',
   timeLow: '#ff6b6b',
+  /** The server's version of where the local player is - the trailing ghost. */
+  ghost: '#6b5bd6',
 } as const;
 
 function drawArena(context: CanvasRenderingContext2D): void {
@@ -82,12 +99,43 @@ function drawCoins(context: CanvasRenderingContext2D, coins: Coin[]): void {
   }
 }
 
+/**
+ * The server's idea of where the local player is, drawn as a hollow outline.
+ *
+ * This ghost is the single most useful thing on the screen in M6. The solid
+ * square is the client's guess, made instantly; the outline is the truth,
+ * arriving one round trip late. Watching the gap between them open when you
+ * start moving and close when you stop is what "prediction" and "latency"
+ * actually look like, and it turns M7 from an abstract next step into a
+ * visible problem: that gap never fully closes on its own.
+ *
+ * Diagnostics, not gameplay. It belongs to the same family as M11's panel.
+ */
+function drawServerGhost(context: CanvasRenderingContext2D, at: Vector2): void {
+  const halfSize = PLAYER_SIZE / 2;
+
+  context.save();
+  context.strokeStyle = COLOURS.ghost;
+  context.lineWidth = 1.5;
+  context.setLineDash([4, 3]);
+  context.strokeRect(at.x - halfSize, at.y - halfSize, PLAYER_SIZE, PLAYER_SIZE);
+  context.restore();
+}
+
 function drawPlayers(context: CanvasRenderingContext2D, view: ViewState): void {
   const halfSize = PLAYER_SIZE / 2;
 
   for (const player of view.players) {
     const isLocal = player.id === view.localPlayerId;
-    const { x, y } = player.position;
+    const predicting = isLocal && view.predicted !== null;
+
+    // The local player is drawn where we PREDICT it is; everyone else is drawn
+    // where the server last said they were. A client may guess about the thing
+    // it controls and nothing else - guessing at the opponent would be
+    // extrapolation, which is M8's problem and needs different machinery.
+    const { x, y } = predicting ? view.predicted! : player.position;
+
+    if (predicting) drawServerGhost(context, player.position);
 
     context.fillStyle = isLocal ? COLOURS.you : COLOURS.them;
     context.fillRect(x - halfSize, y - halfSize, PLAYER_SIZE, PLAYER_SIZE);
@@ -155,6 +203,31 @@ function drawClocks(context: CanvasRenderingContext2D, view: ViewState): void {
     `render ${view.measuredRenderHz.toFixed(0)}Hz`,
     `tick ${view.tick}`,
   ];
+
+  /**
+   * The two M6 numbers.
+   *
+   * `pending` is how many inputs we have sent that the server has not yet
+   * confirmed simulating - roughly one round trip's worth, so it climbs with
+   * latency and is the buffer M7 replays.
+   *
+   * `drift` is how far our guess has wandered from the server's answer, in
+   * pixels. Some of it is honest: the server is simply behind, and that part
+   * shrinks to nothing when you stand still. The part that does NOT come back
+   * is accumulated error from inputs the server never received, and no amount
+   * of standing still fixes it. That residue is precisely what M7 exists for.
+   */
+  if (view.predicted !== null) {
+    const authoritative = view.players.find((player) => player.id === view.localPlayerId);
+    parts.push(`pending ${view.pendingInputCount}`);
+    if (authoritative !== undefined) {
+      const drift = Math.hypot(
+        view.predicted.x - authoritative.position.x,
+        view.predicted.y - authoritative.position.y,
+      );
+      parts.push(`drift ${drift.toFixed(0)}px`);
+    }
+  }
 
   context.fillText(parts.join('   ·   '), 18, ARENA_HEIGHT - 14);
 

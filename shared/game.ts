@@ -10,9 +10,12 @@
  *
  *   > Clients send inputs. The server owns the authoritative game state.
  *
- * The client never calls `update()` in M3. It gets the right to run this code
- * again in M6 — but only to *predict*, and only on the understanding that the
- * server's answer always wins.
+ * The client never calls `update()` in M3, and as of M6 it still does not.
+ * What M6 grants it is narrower and deliberately so: it may call `movePlayer`
+ * on its OWN square, as a guess. It may not run `update()`, because that would
+ * mean predicting coin collection and scores - guessing at a contested
+ * resource that the other player might reach first, and inventing points. The
+ * rule is that a client may predict what it controls and nothing else.
  *
  * M4 note: `update()` is now always called with the SAME `deltaSeconds` - one
  * fixed timestep. It still takes delta as a parameter rather than hard-coding
@@ -300,7 +303,28 @@ function playerTouchesCoin(player: Player, coin: Coin): boolean {
 // Simulation
 // ---------------------------------------------------------------------------
 
-function movePlayer(player: Player, input: InputState, deltaSeconds: number): void {
+/**
+ * Apply one input to one thing with a position, for one fixed step.
+ *
+ * Exported as of M6, and the export is the whole point. The client now runs
+ * this function to predict its own movement - not a copy of it, not a
+ * close-enough reimplementation in client code, but these exact lines. The
+ * client's guess and the server's answer are then produced by identical
+ * arithmetic, so any disagreement between them is caused by a difference in
+ * INPUTS - one of them was lost, or has not arrived yet. That is a problem M7
+ * can solve. Two slightly different movement functions would produce drift
+ * that nothing can solve, because there would be no single right answer to
+ * reconcile towards.
+ *
+ * It takes `{ position }` rather than a whole `Player` because the client's
+ * prediction is not a player - it has no score and no ready flag, it is just a
+ * guess about where one square is.
+ */
+export function movePlayer(
+  entity: { position: Vector2 },
+  input: InputState,
+  deltaSeconds: number,
+): void {
   let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
   let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
 
@@ -310,12 +334,12 @@ function movePlayer(player: Player, input: InputState, deltaSeconds: number): vo
     dy *= inverseLength;
   }
 
-  player.position.x += dx * PLAYER_SPEED * deltaSeconds;
-  player.position.y += dy * PLAYER_SPEED * deltaSeconds;
+  entity.position.x += dx * PLAYER_SPEED * deltaSeconds;
+  entity.position.y += dy * PLAYER_SPEED * deltaSeconds;
 
   const halfSize = PLAYER_SIZE / 2;
-  player.position.x = clamp(player.position.x, halfSize, ARENA_WIDTH - halfSize);
-  player.position.y = clamp(player.position.y, halfSize, ARENA_HEIGHT - halfSize);
+  entity.position.x = clamp(entity.position.x, halfSize, ARENA_WIDTH - halfSize);
+  entity.position.y = clamp(entity.position.y, halfSize, ARENA_HEIGHT - halfSize);
 }
 
 /**

@@ -17,9 +17,17 @@
  *   SIM_HZ=5 npm run game        the world updates in visible lurches
  *   SNAPSHOT_HZ=2 npm run game   the world is smooth; nobody is told in time
  *
+ * M6 changed almost nothing here, which is the interesting part. Prediction is
+ * a CLIENT technique; the server's job is unchanged and it remains the only
+ * authority. All it gained is bookkeeping: inputs arrive numbered, they queue
+ * instead of overwriting each other, and every snapshot reports how far
+ * through each player's stream the simulation has got.
+ *
  * Deliberately NOT here yet:
- *  - anything resembling prediction (M6). The lag you feel playing this is the
- *    entire motivation for M5-M7 and must not be papered over now.
+ *  - reconciliation (M7). This server tells the client what is true; it does
+ *    not yet care that the client disagrees, and the client does not yet act
+ *    on being told. The visible drift that creates is the motivation for M7
+ *    and must not be papered over now.
  *
  * Run: npm run build && npm run game
  */
@@ -32,6 +40,7 @@ import {
   PLAYERS_PER_ROOM,
   addPlayer,
   clearReady,
+  createEmptyInput,
   createInitialState,
   everyoneIsReady,
   refreshLobbyPhase,
@@ -47,6 +56,7 @@ import {
   GAME_PORT,
   parseClientMessage,
   type ClientMessage,
+  type InputAck,
   type ServerMessage,
 } from '../shared/protocol.js';
 import {
@@ -170,19 +180,97 @@ const state: GameState = createInitialState();
 const connections = new Map<WebSocket, Connection>();
 
 /**
- * The latest input received from each player, keyed by id.
+ * Inputs waiting to be simulated, per player, oldest first.
  *
- * The server keeps the LAST input it heard and reapplies it every tick until
- * told otherwise. Clients send only on change, so this map is what turns
- * occasional "I started holding RIGHT" messages into continuous movement.
+ * M5 kept a single "latest input" here and reapplied it every tick. That is
+ * the right shape for a client that only speaks when something changes, and it
+ * is the wrong shape for M6, because prediction rests on one invariant:
  *
- * The flaw is deliberate and worth remembering: if the packet saying "I let go
- * of RIGHT" is lost, this server will happily run that player into the wall
- * forever. Nothing loses packets on localhost, so the bug is invisible until
- * M5 introduces packet loss on purpose - which is exactly the sort of failure
- * the plan wants demonstrated before it is fixed.
+ *     one input is applied for exactly one fixed step
+ *
+ * The client believes that when it predicts. If the server collapsed three
+ * arrivals into "whichever came last", the client would have predicted three
+ * steps of movement the server never ran, and the two would drift apart for
+ * reasons that have nothing to do with the network - which is the worst kind
+ * of bug to go looking for while also debugging a network.
+ *
+ * So inputs queue, and the simulation consumes one per player per step.
  */
-const latestInputs = new Map<PlayerId, InputState>();
+interface QueuedInput {
+  seq: number;
+  input: InputState;
+}
+
+const inputQueues = new Map<PlayerId, QueuedInput[]>();
+
+/**
+ * Per player: the sequence number of the last input this server simulated.
+ *
+ * Kept here rather than on `Player` - see `InputAck` in the protocol for why.
+ */
+const lastProcessedInput = new Map<PlayerId, number>();
+
+/**
+ * How many un-simulated inputs one player may bank.
+ *
+ * A client whose clock runs a little fast, or one catching up after a stall,
+ * can hand over inputs faster than this server consumes them. Left alone the
+ * queue grows without limit and that player ends up playing several seconds in
+ * their own past, still feeling responsive locally while the server acts out
+ * ancient history.
+ *
+ * Dropping the OLDEST is the right end to drop from: the newest input is the
+ * one that reflects what the human is doing now.
+ */
+const MAX_QUEUED_INPUTS = 10;
+
+/**
+ * Take one input per player for the step that is about to run.
+ *
+ * Called once per SIMULATION STEP, not once per timer fire. That distinction
+ * matters during a catch-up pass: three steps in one pass must consume three
+ * inputs, or the server would apply the same input three times and then have
+ * two inputs left over that the client already counts as spent.
+ */
+function collectInputsForTick(): ReadonlyMap<PlayerId, InputState> {
+  const inputs = new Map<PlayerId, InputState>();
+
+  for (const [playerId, queue] of inputQueues) {
+    const next = queue.shift();
+    if (next !== undefined) lastProcessedInput.set(playerId, next.seq);
+
+    /**
+     * No input this step means no movement this step. The player stands still.
+     *
+     * The first version of this repeated the last input when the queue ran
+     * dry, on the M5 reasoning that a player holding a key should keep moving
+     * through a lost packet. Testing killed it. A browser tab in the
+     * background gets its timers throttled to about 1Hz, so the client's
+     * accumulator produced ~7 inputs per second while this server ticked 30
+     * times - and the repeat turned each of those 7 inputs into 4 steps of
+     * movement. The client predicted a quarter of a second of travel; the
+     * server ran a full second of it and put the player in a wall.
+     *
+     * That is a worse failure than the stutter it was avoiding, and worse in
+     * the specific way that matters here: the server moved a player further
+     * than they asked. Reconciliation cannot repair a disagreement where the
+     * authority is inventing input, because there is no wrong guess to correct
+     * - there is a right guess and an authority that made something up.
+     *
+     * So the invariant holds exactly, in both directions:
+     *
+     *     one input  -> one step
+     *     no input   -> no step
+     *
+     * The cost is honest and small: a lost input costs exactly the movement it
+     * described, one step of ~8px, and the next input lands 33ms later. The
+     * cost of the alternative was unbounded.
+     */
+    inputs.set(playerId, next?.input ?? createEmptyInput());
+  }
+
+  return inputs;
+}
 
 let nextPlayerId: PlayerId = 1;
 
@@ -253,6 +341,12 @@ function broadcastSnapshot(): void {
     players: state.players,
     coins: state.coins,
     timeRemaining: state.timeRemaining,
+    acks: state.players.map(
+      (player): InputAck => ({
+        playerId: player.id,
+        lastProcessedInput: lastProcessedInput.get(player.id) ?? 0,
+      }),
+    ),
     playersPerRoom: PLAYERS_PER_ROOM,
     simulationHz: SIMULATION_HZ,
     snapshotHz: SNAPSHOT_HZ,
@@ -303,21 +397,40 @@ function handleClientMessage(socket: WebSocket, message: ClientMessage): void {
   }
 
   /**
-   * The input is recorded, not acted upon. It will be applied by the next
-   * tick, along with everyone else's, so no player gains an advantage by
-   * sending more messages per second than anyone else.
-   *
-   * M5 note: this map is the planted bug. The server keeps the last input it
-   * heard and reapplies it every tick until told otherwise - so if the message
-   * saying "I released D" is the one the simulator drops, this player keeps
-   * running right until their next keypress.
+   * The input is queued, not acted upon. It will be applied by a later tick,
+   * along with everyone else's, so no player gains an advantage by sending
+   * more messages per second than anyone else.
    */
-  latestInputs.set(connection.playerId, {
-    up: message.up,
-    down: message.down,
-    left: message.left,
-    right: message.right,
+  const queue = inputQueues.get(connection.playerId);
+  if (queue === undefined) return;
+
+  /**
+   * Refuse anything not newer than what we already hold.
+   *
+   * This guard is not theoretical. Jitter reorders: two inputs sent a tick
+   * apart with delays of 180ms and 120ms arrive backwards, and without this
+   * the server would simulate #204 and then #203, walking the player back
+   * through their own history. It also swallows duplicates for free.
+   *
+   * Compared against the newest input QUEUED, not the newest SIMULATED -
+   * otherwise a burst arriving between two ticks would all compare against the
+   * same stale watermark and queue out of order among themselves.
+   */
+  const alreadyProcessed = lastProcessedInput.get(connection.playerId) ?? 0;
+  const newestSeen = queue.length > 0 ? queue[queue.length - 1]!.seq : alreadyProcessed;
+  if (message.seq <= newestSeen) return;
+
+  queue.push({
+    seq: message.seq,
+    input: {
+      up: message.up,
+      down: message.down,
+      left: message.left,
+      right: message.right,
+    },
   });
+
+  while (queue.length > MAX_QUEUED_INPUTS) queue.shift();
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +474,8 @@ server.on('connection', (socket) => {
 
   connections.set(socket, { socket, playerId, outbound, inbound });
   addPlayer(state, playerId);
-  latestInputs.set(playerId, { up: false, down: false, left: false, right: false });
+  inputQueues.set(playerId, []);
+  lastProcessedInput.set(playerId, 0);
 
   console.log(`[join]  player ${playerId} (${connections.size}/${PLAYERS_PER_ROOM})`);
   send(socket, { type: 'welcome', playerId });
@@ -407,7 +521,8 @@ server.on('connection', (socket) => {
 
     connections.delete(socket);
     removePlayer(state, connection.playerId);
-    latestInputs.delete(connection.playerId);
+    inputQueues.delete(connection.playerId);
+    lastProcessedInput.delete(connection.playerId);
 
     console.log(
       `[leave] player ${connection.playerId} (code ${code}) - ` +
@@ -523,7 +638,9 @@ setInterval(
     accumulator += Math.min(elapsedSeconds, MAX_ACCUMULATED_SECONDS);
 
     while (accumulator >= FIXED_DELTA_SECONDS) {
-      update(state, latestInputs, FIXED_DELTA_SECONDS);
+      // Inputs are collected per STEP, so a catch-up pass of three steps
+      // consumes three inputs rather than replaying one of them three times.
+      update(state, collectInputsForTick(), FIXED_DELTA_SECONDS);
       accumulator -= FIXED_DELTA_SECONDS;
     }
   },

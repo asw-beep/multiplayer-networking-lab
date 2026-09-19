@@ -30,6 +30,20 @@ export const GAME_PORT = 8081;
  */
 export interface InputMessage {
   type: 'input';
+  /**
+   * A monotonically increasing number naming this input, added in M6.
+   *
+   * Without it, an input is an anonymous instruction and the only question a
+   * client can ask is "where am I?". With it, the client can ask the far more
+   * useful question: "which of the things I told you have you actually
+   * simulated?" - and that is the question prediction and reconciliation are
+   * both built on.
+   *
+   * It counts inputs, not ticks and not milliseconds. The client's clock and
+   * the server's are never going to agree; a number both sides can count is
+   * cheaper and more reliable than a timestamp either side has to trust.
+   */
+  seq: number;
   up: boolean;
   down: boolean;
   left: boolean;
@@ -68,6 +82,25 @@ export interface RoomFullMessage {
 }
 
 /**
+ * How far through one player's input stream the server has got.
+ *
+ * Note where this lives: in the snapshot, beside the world, and NOT as a field
+ * on `Player`. Gambetta hangs `last_processed_input` on the entity, and plenty
+ * of engines do the same, but a player's position and score are the world
+ * while this is bookkeeping about a socket. Rule 4 of this project says game
+ * logic stays independent of networking - so `shared/game.ts` never learns
+ * that sequence numbers exist, and `update()` never sees one.
+ *
+ * Every client receives every player's ack, because snapshots are broadcast
+ * identically to everyone. Each client only has any use for its own.
+ */
+export interface InputAck {
+  playerId: PlayerId;
+  /** The sequence number of the last input the server actually simulated. */
+  lastProcessedInput: number;
+}
+
+/**
  * The server's description of the world, as of a particular simulation step.
  *
  * This is a *full* snapshot: every player, every coin, every time. It is
@@ -87,6 +120,14 @@ export interface SnapshotMessage {
   players: Player[];
   coins: Coin[];
   timeRemaining: number;
+  /**
+   * One entry per player: how far through their inputs the server has got.
+   *
+   * This is what turns a snapshot from "here is the world at tick N" into
+   * "here is the world at tick N, and it already includes your input #217".
+   * A client can then tell which of its own guesses are still outstanding.
+   */
+  acks: InputAck[];
   /** How many players the room needs before a match can start. */
   playersPerRoom: number;
   /**
@@ -145,8 +186,19 @@ export function parseClientMessage(raw: string): ClientMessage | null {
   const flags = ['up', 'down', 'left', 'right'] as const;
   if (!flags.every((flag) => typeof message[flag] === 'boolean')) return null;
 
+  /**
+   * `seq` is checked harder than the booleans, because it is the one field a
+   * client could use to damage the server rather than merely to lie about
+   * itself. A `NaN` or an `Infinity` here would poison every comparison it
+   * touches - `NaN <= anything` is false, so a single bad frame would make
+   * every subsequent input look newer and jam the duplicate filter open.
+   */
+  const seq = message['seq'];
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0) return null;
+
   return {
     type: 'input',
+    seq,
     up: message['up'] as boolean,
     down: message['down'] as boolean,
     left: message['left'] as boolean,
